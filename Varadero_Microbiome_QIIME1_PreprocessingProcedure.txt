@@ -1,0 +1,96 @@
+# VARADERO 16S MICROBIOME PRE-PROCESSING
+## Performed using QIIME1
+
+# Join paired ends
+multiple_join_paired_ends.py -i renamed_E19/ -o paired_E19/
+multiple_join_paired_ends.py -i renamed_E18/ -o paired_E18/
+
+# Remove fastqs that didn’t join
+mkdir nonjoin_E18
+mkdir nonjoin_E19
+# E19
+find paired_E19/ -name “fastqjoin.un*” -print -exec mv {} nonjoin_E19/ \; 
+find paired_E19/ -size “0” -print -exec mv {} nonjoin_E19/ \;
+# E18
+find paired_E18/ -name “fastqjoin.un*” -print -exec mv {} nonjoin_E18/ \; 
+find paired_E18/ -size “0” -print -exec mv {} nonjoin_E18/ \;
+
+# Edit folder names for each sample
+## Current name format: C800_S146_L001_R1_001
+## The script below will remove everything starting from the first underscore until the end:
+## E19
+for dir in paired_E19/*; do
+dirname=$(basename ${dir})
+dirmid=${dirname%%_S*}
+echo $dirmid
+cp -r ${dir} renamed_paired_E19/${dirmid}
+done
+## E18
+for dir in paired_E18/*; do
+dirname=$(basename ${dir})
+dirmid=${dirname%%_S*}
+echo $dirmid
+cp -r ${dir} renamed_paired_E18/${dirmid}
+done
+
+# Run multiple_split_libraries
+## Name each sequence after the directory name, ignore the file name
+multiple_split_libraries_fastq.py -i renamed_paired_E19/ -o renamed_paired_E19/ --demultiplexing_method sampleid_by_file --include_input_dir_path --remove_filepath_in_name
+multiple_split_libraries_fastq.py -i renamed_paired_E18/ -o renamed_paired_E18/ --demultiplexing_method sampleid_by_file --include_input_dir_path --remove_filepath_in_name
+
+### Result: seqs.fna file in each renamed_paired folder. 
+
+# There are well over 200 samples in the E18 folder, which resulted in the chimera picking to fail as it required too much memory.
+# Solution: Split samples into two groups and then use multiple_split_libraries on those two groups separately. Pass each .fna file through the identify chimeric seqs pipeline, then cat them all together in the end.
+mkdir set_a
+mkdir set_b
+mv C6* set_a/
+mv C7* set_b/
+mv C8* set_b/
+multiple_split_libraries_fastq.py -i set_a/ -o set_a/ --demultiplexing_method sampleid_by_file --include_input_dir_path --remove_filepath_in_name
+multiple_split_libraries_fastq.py -i set_b/ -o set_b/ --demultiplexing_method sampleid_by_file --include_input_dir_path --remove_filepath_in_name
+
+# Rename seqs.fna files to avoid confusions down the line
+mv set_a/seqs.fna set_a/seqs_E18a.fna
+mv set_b/seqs.fna set_b/seqs_E18b.fna
+
+# Identify chimeric sequences using USEARCH 6.1
+## E19
+identify_chimeric_seqs.py -i renamed_paired_E19/seqs_E19.fna -m usearch61 -o usearch_chimeras_E19 -r 97_otus.fasta --threads 20
+## E18a
+identify_chimeric_seqs.py -i renamed_paired_E18/set_a/seqs_E18a.fna -m usearch61 -o usearch_chimeras_E18/set_a/ -r 97_otus.fasta --threads 20
+## E18b
+identify_chimeric_seqs.py -i renamed_paired_E18/set_b/seqs_E18b.fna -m usearch61 -o usearch_chimeras_E18/set_b/ -r 97_otus.fasta --threads 20
+
+# Remove identified chimeras
+## E19
+filter_fasta.py -f renamed_paired_E19/seqs_E19.fna -o renamed_paired_E19/chimera_filtered_E19.fna -s usearch_chimeras_E19/chimeras.txt -n
+## E18a
+filter_fasta.py -f renamed_paired_E18/set_a/seqs_E18a.fna -o renamed_paired_E18/set_a/chimera_filtered_E18a.fna -s usearch_chimeras_E18/set_a/chimeras.txt -n
+## E18b
+filter_fasta.py -f renamed_paired_E18/set_b/seqs_E18b.fna -o renamed_paired_E18/set_b/chimera_filtered_E18b.fna -s usearch_chimeras_E18/set_b/chimeras.txt -n
+
+# Cat files together for otu picking
+cat renamed_paired_E18/set_b/chimera_filtered_E18b.fna renamed_paired_E18/set_a/chimera_filtered_E18a.fna > chimera_filt_E18ab.fna
+cat renamed_paired_E19/chimera_filtered_E19.fna chimera_filt_E18ab.fna > chimera_filt_all.fna
+
+# Pick open ref otus
+pick_open_reference_otus.py -i chimera_filtered.fna -o otus_open_ref_usearch -m usearch61 -f -p pick_otus_parameters.txt -aO 15 -r 97_otus.fasta
+
+## Result: 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
