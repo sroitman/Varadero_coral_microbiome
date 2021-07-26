@@ -1,0 +1,1207 @@
+---
+title: "Statistical analyses: Varadero coral microbiome"
+author: "Sofia Roitman"
+date: "August 2020"
+output: html_document
+---
+
+# Set working directory
+```{r message = FALSE}
+setwd("")
+
+# Clear environment
+rm(list=ls())
+```
+
+
+# Load libraries and functions
+```{r message=FALSE, error=FALSE}
+library(tidyverse)
+library(RVAideMemoire)
+library(vegan)
+library(BiocManager)
+library(phyloseq)
+library(rhdf5)
+library(biomformat)
+library(microbiome)
+library(dplyr)
+library(hrbrthemes)
+library(gcookbook)
+library(tidyverse)
+library(ape)
+library(Biostrings)
+library(genefilter)
+library(magrittr)
+library(DESeq2)
+library(plyr)
+library(data.table)
+library(phytools)
+library(stringi)
+library(ggpubr)
+# Load read_hdf5
+source('/Users/sofiaroitman/Dropbox/GRAD_SCHOOL/SR_data_analysis/data_analysis_GCMP_Medina_Lab/RAPID_16S/r_analysis/read_hdf5.r')
+```
+
+
+# Import and load data
+## Convert data into phyloseq format
+```{r message=FALSE}
+print(date())
+# Put paths to files into objects
+otufile <- 'otu_table_E18_E19.biom'
+treefile <- 'rep_set.tre'
+mapfile <- 'rapid_map_v8_wat.txt'
+
+# Convert data to phyloseq format
+map <- import_qiime_sample_data(mapfile) # this is the metadata
+
+# Ensure biom file is being read and interpreted as a biom file
+biom_object <- biom(read_hdf5_biom(otufile))
+
+# Read biom file as an OTU table
+otus <- otu_table(as.matrix(biom_data(biom_object)), taxa_are_rows=T)
+
+# Import taxonomy table
+tax <- as.matrix(read.table("rep_set_tax_assignments_E18_E19_v2.txt", sep="\t", header=T, row.names=1))
+## Formatting: use first column as row names; split taxonomy assignments by the ";" separator; combine original file with split file; assign column names; remove unnecessary columns 
+tax_otu <- rownames_to_column(as.data.frame(tax), "OTU")
+tax_split <- stri_split_fixed(as.character(tax[,1]),";",simplify=TRUE)
+cbind(tax_otu,tax_split)->tax_all
+obs_meta_new <- tax_table(tax_all)
+colnames(tax_table(obs_meta_new)) <- c('OTU','Taxonomy','Kingdom','Phylum','Class','Order','Family','Genus','Species')
+row.names(tax_table(obs_meta_new)) <-row.names(tax)
+tax_table(obs_meta_new) <- tax_table(obs_meta_new)[,2:9]
+
+
+# Begin merging objects
+otus <- merge_phyloseq(otus,obs_meta_new)
+otu_data <- merge_phyloseq(otus,map)
+
+# Load phylogeny
+phyfile <- read.tree(treefile)
+
+# Generate master phyloseq object
+rt_raw <- phyloseq(otu_table(otu_data),map,obs_meta_new,phyfile)
+
+#Have a look at the summary
+rt_raw
+
+# Remove anything with no assigned phylum
+trash=obs_meta_new[,-1]
+tax_minus_bac_only=trash[as.logical(trash[,2]!=""),1:7]
+counts=t(data.frame(biom_object$data))
+counts_minus_bac=counts[as.logical(trash[,2]!=""),]
+rownames(counts_minus_bac)<-rownames(tax_minus_bac_only)
+rt_raw=phyloseq(otu_table(counts_minus_bac,taxa_are_rows = TRUE),tax_table(tax_minus_bac_only),map,phyfile)
+
+# Fix taxonomy names
+tax_table(rt_raw)[,colnames(tax_table(rt_raw))] <- gsub(tax_table(rt_raw)[,colnames(tax_table(rt_raw))],pattern=" [a-z]__",replacement="")
+tax_table(rt_raw)[,colnames(tax_table(rt_raw))] <- gsub(tax_table(rt_raw)[,colnames(tax_table(rt_raw))],pattern="[a-z]__",replacement="")
+
+```
+
+# Replace blank entries
+```{r}
+tax2 <- data.frame(tax_table(rt_raw))
+tax.clean <- data.frame(row.names = row.names(tax2), 
+                        Kingdom = tax2[,1],
+                        Phylum = tax2[,2],
+                        Class = tax2[,3],
+                        Order = tax2[,4],
+                        Family = tax2[,5],
+                        Genus = tax2[,6],
+                        Species = tax2[,7],
+                        stringsAsFactors = FALSE)
+tax.clean[is.na(tax.clean)] <- ""
+
+for (i in 1:7){ tax.clean[,i] <- as.character(tax.clean[,i])}
+####### Fill holes in the tax table
+tax.clean[is.na(tax.clean)] <- ""
+for (i in 1:nrow(tax.clean)){
+  if (tax.clean[i,2] == ""){
+    kingdom <- paste("Kingdom_", tax.clean[i,1], sep = "")
+    tax.clean[i, 2:7] <- kingdom
+    } else if (tax.clean[i,3] == ""){
+      phylum <- paste("Phylum_", tax.clean[i,2], sep = "")
+      tax.clean[i, 3:7] <- phylum
+      } else if (tax.clean[i,4] == ""){
+        class <- paste("Class_", tax.clean[i,3], sep = "")
+        tax.clean[i, 4:7] <- class
+        } else if (tax.clean[i,5] == ""){
+          order <- paste("Order_", tax.clean[i,4], sep = "")
+          tax.clean[i, 5:7] <- order
+          } else if (tax.clean[i,6] == ""){
+            family <- paste("Family_", tax.clean[i,5], sep = "")
+            tax.clean[i, 6:7] <- family
+            } else if (tax.clean[i,7] == ""){
+              tax.clean$Species[i] <- paste("Genus",tax.clean$Genus[i], sep = "_")
+            }
+}
+
+tax_table(rt_raw) <- as.matrix(tax.clean)
+```
+
+
+# Remove chloroplast sequences
+```{r}
+rt_raw_nochlor = subset_taxa(rt_raw, Class != "Chloroplast")
+
+```
+
+
+#Preprocessing
+[link](https://joey711.github.io/phyloseq/preprocess)
+Remove samples with less than x number of reads (here we use 1000)
+```{r}
+# Not necessary if you've already rarefied to a depth of 1000
+rt_highcover <- prune_samples(sample_sums(rt_raw_nochlor)>=1000, rt_raw_nochlor)
+# Remove singletons
+rt_highcover_ns = filter_taxa(rt_highcover, function(x) sum(x) > 1, TRUE)
+# Summary
+rt_highcover_ns
+
+rt_highcover_ns_abun <- rt_highcover_ns
+
+
+```
+
+
+## Subset
+```{r}
+# Have objects with all samples but no undesirables (i.e. samples not part of transplant and mother colony)
+rt_highcover_ns_abun_noNA1 = subset_samples(rt_highcover_ns_abun, Transplantation_status != "NA")
+rt_highcover_ns_abun_noNA = subset_samples(rt_highcover_ns_abun_noNA1, Transplantation_status != "H2O")
+rt_highcover_ns_abun_nomom = subset_samples(rt_highcover_ns_abun_noNA, Transplantation_status != "mother_colony")
+rt_highcover_ns_abun_onlymom = subset_samples(rt_highcover_ns_abun_noNA, Transplantation_status == "mother_colony")
+
+# Just E18 mom and pre
+rt_highcover_ns_abun_E18 = subset_samples(rt_highcover_ns_abun_noNA, Transplantation_status != "posttransplantation" )
+rt_highcover_ns_abun_E18_var = subset_samples(rt_highcover_ns_abun_E18, Transplanted_from == "Varadero")
+rt_highcover_ns_abun_E18_ros = subset_samples(rt_highcover_ns_abun_E18, Transplanted_from == "Rosario")
+
+# all transplant samples + water
+rt_highcover_ns_abun_allwat = subset_samples(rt_highcover_ns_abun, Transplant_YN == "y")
+rt_highcover_ns_abun_allwat_post1 = subset_samples(rt_highcover_ns_abun_allwat, Transplantation_status != "pretransplantation")
+rt_highcover_ns_abun_allwat_post = subset_samples(rt_highcover_ns_abun_allwat_post1, Transplantation_status != "mother_colony")
+
+# Subset by origin
+rt_highcover_ns_abun_ros = subset_samples(rt_highcover_ns_abun_nomom, Transplanted_from == "Rosario")
+rt_highcover_ns_abun_var = subset_samples(rt_highcover_ns_abun_nomom, Transplanted_from == "Varadero")
+
+# Subset by pre and post transplantation
+rt_highcover_ns_abun_post = subset_samples(rt_highcover_ns_abun_noNA, Transplantation_status == "posttransplantation")
+rt_highcover_ns_abun_pre = subset_samples(rt_highcover_ns_abun_noNA, Transplantation_status == "pretransplantation")
+
+# Subset by transplanted to
+rt_highcover_ns_abun_cbay = subset_samples(rt_highcover_ns_abun_noNA, transplanted_to == "Cartagena_Bay")
+rt_highcover_ns_abun_tovar = subset_samples(rt_highcover_ns_abun_noNA, transplanted_to == "Varadero")
+rt_highcover_ns_abun_toros = subset_samples(rt_highcover_ns_abun_noNA, transplanted_to == "Rosario")
+
+# Subset by origin and pre v post
+## Rosario
+rt_highcover_ns_abun_ros_pre = subset_samples(rt_highcover_ns_abun_ros, Transplantation_status == "pretransplantation")
+rt_highcover_ns_abun_ros_post = subset_samples(rt_highcover_ns_abun_ros, Transplantation_status == "posttransplantation")
+## Varadero
+rt_highcover_ns_abun_var_pre = subset_samples(rt_highcover_ns_abun_var, Transplantation_status == "pretransplantation")
+rt_highcover_ns_abun_var_post = subset_samples(rt_highcover_ns_abun_var, Transplantation_status == "posttransplantation")
+
+
+# Subset by origin and pre+mom
+rt_highcover_ns_abun_roswmom = subset_samples(rt_highcover_ns_abun_noNA, sampling_reef_name == "Rosario")
+rt_highcover_ns_abun_varwmom = subset_samples(rt_highcover_ns_abun_noNA, sampling_reef_name == "Varadero")
+## Rosario
+rt_highcover_ns_abun_ros_premom = subset_samples(rt_highcover_ns_abun_roswmom, Transplantation_status != "posttransplantation")
+## Varadero
+rt_highcover_ns_abun_var_premom = subset_samples(rt_highcover_ns_abun_varwmom, Transplantation_status != "posttransplantation")
+
+```
+
+
+## OTU table summary stats
+```{r}
+print("total")
+sum(sample_sums(rt_highcover_ns_abun_noNA))
+print("min")
+min(sample_sums(rt_highcover_ns_abun_noNA))
+print("mean")
+mean(sample_sums(rt_highcover_ns_abun_noNA))
+print("median")
+median(sample_sums(rt_highcover_ns_abun_noNA))
+print("max")
+max(sample_sums(rt_highcover_ns_abun_noNA))
+
+ntaxa(rt_highcover_ns_abun_noNA)
+nsamples(rt_highcover_ns_abun_noNA)
+
+
+print("mean_postros")
+mean(sample_sums(rt_highcover_ns_abun_toros))
+print("mean_postcar")
+mean(sample_sums(rt_highcover_ns_abun_cbay))
+print("mean_postvar")
+mean(sample_sums(rt_highcover_ns_abun_tovar))
+print("mean_preros")
+mean(sample_sums(rt_highcover_ns_abun_ros_pre))
+print("mean_prevar")
+mean(sample_sums(rt_highcover_ns_abun_var_pre))
+print("mean_mom")
+mean(sample_sums(rt_highcover_ns_abun_onlymom))
+
+```
+
+
+## Create distance matrices
+```{r message=FALSE, error=FALSE}
+# RAW ABUNDANCE
+## All samples except mother colonies, raw counts
+bc_rt_highcover_ns_abun_nomom <- phyloseq::distance(rt_highcover_ns_abun_nomom, "bray")
+wuni_rt_highcover_ns_abun_nomom <- phyloseq::distance(rt_highcover_ns_abun_nomom, "wUniFrac")
+uuni_rt_highcover_ns_abun_nomom <- phyloseq::distance(rt_highcover_ns_abun_nomom, "uunifrac")
+
+## All samples including mother colonies
+bc_rt_highcover_ns_abun_noNA <- phyloseq::distance(rt_highcover_ns_abun_noNA, "bray")
+uuni_rt_highcover_ns_abun_noNA <- phyloseq::distance(rt_highcover_ns_abun_noNA, "uunifrac")
+wuni_rt_highcover_ns_abun_noNA <- phyloseq::distance(rt_highcover_ns_abun_noNA, "wunifrac")
+
+## Pre-transplant and mother colony fragments
+bc_rt_highcover_ns_abun_E18 <- phyloseq::distance(rt_highcover_ns_abun_E18, "bray")
+
+# Subset by pre vs. post transplantation
+## Pre
+bc_rt_highcover_ns_abun_pre <- phyloseq::distance(rt_highcover_ns_abun_pre, "bray")
+wuni_rt_highcover_ns_abun_pre <- phyloseq::distance(rt_highcover_ns_abun_pre, "wunifrac")
+uuni_rt_highcover_ns_abun_pre <- phyloseq::distance(rt_highcover_ns_abun_pre, "uunifrac")
+
+## Post
+bc_rt_highcover_ns_abun_post <- phyloseq::distance(rt_highcover_ns_abun_post, "bray")
+wuni_rt_highcover_ns_abun_post <- phyloseq::distance(rt_highcover_ns_abun_post, "wunifrac")
+uuni_rt_highcover_ns_abun_post <- phyloseq::distance(rt_highcover_ns_abun_post, "uunifrac")
+
+# Subset by location and status
+## Rosario
+bc_rt_highcover_ns_abun_ros <- phyloseq::distance(rt_highcover_ns_abun_ros, "bray")
+wuni_rt_highcover_ns_abun_ros <- phyloseq::distance(rt_highcover_ns_abun_ros, "wunifrac")
+uuni_rt_highcover_ns_abun_ros <- phyloseq::distance(rt_highcover_ns_abun_ros, "uunifrac")
+### Pre
+bc_rt_highcover_ns_abun_ros_pre <- phyloseq::distance(rt_highcover_ns_abun_ros_pre, "bray")
+wuni_rt_highcover_ns_abun_ros_pre <- phyloseq::distance(rt_highcover_ns_abun_ros_pre, "wunifrac")
+uuni_rt_highcover_ns_abun_ros_pre <- phyloseq::distance(rt_highcover_ns_abun_ros_pre, "uunifrac")
+### Post
+bc_rt_highcover_ns_abun_ros_post <- phyloseq::distance(rt_highcover_ns_abun_ros_post, "bray")
+wuni_rt_highcover_ns_abun_ros_post <- phyloseq::distance(rt_highcover_ns_abun_ros_post, "wunifrac")
+uuni_rt_highcover_ns_abun_ros_post <- phyloseq::distance(rt_highcover_ns_abun_ros_post, "uunifrac")
+## Varadero
+bc_rt_highcover_ns_abun_var <- phyloseq::distance(rt_highcover_ns_abun_var, "bray")
+wuni_rt_highcover_ns_abun_var <- phyloseq::distance(rt_highcover_ns_abun_var, "wunifrac")
+uuni_rt_highcover_ns_abun_var <- phyloseq::distance(rt_highcover_ns_abun_var, "uunifrac")
+### Pre
+bc_rt_highcover_ns_abun_var_pre <- phyloseq::distance(rt_highcover_ns_abun_var_pre, "bray")
+wuni_rt_highcover_ns_abun_var_pre <- phyloseq::distance(rt_highcover_ns_abun_var_pre, "wunifrac")
+uuni_rt_highcover_ns_abun_var_pre <- phyloseq::distance(rt_highcover_ns_abun_var_pre, "uunifrac")
+### Post
+bc_rt_highcover_ns_abun_var_post <- phyloseq::distance(rt_highcover_ns_abun_var_post, "bray")
+wuni_rt_highcover_ns_abun_var_post <- phyloseq::distance(rt_highcover_ns_abun_var_post, "wunifrac")
+uuni_rt_highcover_ns_abun_var_post <- phyloseq::distance(rt_highcover_ns_abun_var_post, "uunifrac")
+
+# Origin + premom
+bc_rt_highcover_ns_abun_var_premom <- phyloseq::distance(rt_highcover_ns_abun_var_premom, "bray")
+bc_rt_highcover_ns_abun_ros_premom <- phyloseq::distance(rt_highcover_ns_abun_ros_premom, "bray")
+
+# All + water
+bc_rt_highcover_ns_abun_allwat <- phyloseq::distance(rt_highcover_ns_abun_allwat, "bray")
+bc_rt_highcover_ns_abun_allwat_post <- phyloseq::distance(rt_highcover_ns_abun_allwat_post, "bray")
+
+# Just water
+bc_rt_highcover_wat <- phyloseq::distance(rt_highcover_wat, "bray")
+wuni_rt_highcover_wat <- phyloseq::distance(rt_highcover_wat, "wunifrac")
+uuni_rt_highcover_wat <- phyloseq::distance(rt_highcover_wat, "uunifrac")
+```
+
+
+
+## Set ggplot theme and color sets
+```{r}
+ggtheme <- theme(axis.title = element_text(colour="black",family = "Helvetica",
+                                           size = rel(1.5)), 
+                 axis.text = element_text(family = "Helvetica",colour = "black",
+                                          size = rel(1)), 
+                 axis.line = element_line(size = 0.5,colour = "black"), 
+                 axis.ticks = element_blank(),
+                 panel.grid.major = element_line(colour="grey",size = rel(0.25)), 
+                 panel.grid.minor = element_blank(), 
+                 panel.background = element_blank(),
+                 plot.title = element_text(colour = "black", face = "bold",
+                                           size = rel(2),family = "Helvetica",hjust = 0.5,
+                 geom_point(size = 20)))
+
+# Color set used for PCoA comparison between the three sites (Varadero, Rosario, Cartagena)
+site_col <- c("#984807", "#00B0F0", "#FFC000")
+
+# Color set used for PCoA comparison between all coral samples, pre and post transplantation
+site_col2 <- c("#FFC000","forestgreen","#00B0F0", "royalblue3", "#984807", "mediumvioletred")
+
+# Color palette used for PCoA comparsion between all samples, including water
+site_col3 <- c("#FFC000","red","forestgreen","#00B0F0", "royalblue3", "#984807", "mediumvioletred")
+
+# Color palette used for PCoA comparison between post-transplant samples including water
+site_col4 <- c("#FFC000", "red", "#00B0F0", "#984807")
+
+# Color palette used for the Rosario bar plot
+pastel_palette_ros <- c("grey90", "darkseagreen", "lightblue", "tan", "orchid4", "plum3", "darkgoldenrod3","cornflowerblue","palegreen4", "sandybrown","lightpink3","cadetblue", "indianred3")
+
+# Color palette used for the Varadero bar plot
+pastel_palette_var <- c("grey90","lightblue","tan","orchid4","plum3", "sandybrown", "violetred3", "cornflowerblue", "cadetblue", "palevioletred", "palegreen4", "steelblue3","mediumpurple3")
+
+# Color palette used for the Cartagena Bay bar plot
+pastel_palette_car <- c("grey90", "violetred3", "tan", "lightblue", "orchid4", "plum3", "seagreen" ,"sandybrown", "palevioletred", "steelblue3", "thistle4", "hotpink3", "darkseagreen4" )
+
+# Color palette used for Varadero pre-transplant fragments bar plot
+pastel_palette_E18var <- c("grey90","sandybrown","steelblue3","darkgoldenrod3","plum3","tan","violetred3","lightblue","maroon","turquoise4","orchid4","hotpink4","pink3")
+
+# Color palette used for Rosario pre-transplant fragments bar plot
+pastel_palette_E18ros <- c("grey90","sandybrown","pink3","darkgoldenrod3","plum3","turquoise4","steelblue3","lightblue","tan","maroon","palegreen4","violetred3","orchid4")
+```
+
+
+# GROUP SIGNIFICANCE TESTING
+
+## ALL SAMPLES (mother, pre, post)
+### Test for group differencesin all data: (~ sampling_reef_name+parent_colony+Transplantation_status+field_host_name)
+```{r}
+## ALL ABUNDANCES
+print(date())
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_noNA))
+distance_methods <-c("bc_rt_highcover_ns_abun_noNA", "uuni_rt_highcover_ns_abun_noNA", "wuni_rt_highcover_ns_abun_noNA")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "Transplantation_status+Transplanted_from+status+depth_m", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_ALL_status_from_depth_nochlor",date(),".txt"))
+} 
+
+```
+
+
+### Posthoc: group differences in all data: (~ sampling_reef_name+parent_colony+transplantation_status)
+```{r}
+# ALL SAMPLES
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_noNA))
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_noNA,df$Transplantation_status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Species
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_noNA,df$Transplanted_from,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_noNA,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_noNA,df$depth_m,nperm=1000)
+
+
+
+# All fragment samples with water samples
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_allwat))
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_allwat,df$compartment,nperm=1000)
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_allwat,df$Transplantation_status,nperm=1000)
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_allwat,df$status,nperm=1000)
+
+```
+
+
+## PRETRANSPLANTATION
+### Pretransplant fragments only
+#### Adonis
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_pre))
+distance_methods <-c("bc_rt_highcover_ns_abun_pre", "uuni_rt_highcover_ns_abun_pre", "wuni_rt_highcover_ns_abun_pre")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "depth_m+Transplanted_from+status", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_Pre_depth_m+Transplanted_from+status",date(),".txt"))
+} 
+
+```
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_pre))
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_pre,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_pre,df$depth_m,nperm=1000)
+
+```
+
+### Pretransplant fragments and mother colonies
+#### Adonis
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_E18))
+distance_methods <-c("bc_rt_highcover_ns_abun_E18")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "depth_m+Transplantation_status+status", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_E18_depth_m+Transplantation_status+status",date(),".txt"))
+}
+
+```
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_E18))
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_E18,df$Transplantation_status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Transplanted from
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_E18,df$Transplanted_from,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_E18,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_E18,df$depth_m,nperm=1000)
+
+```
+
+## POSTRANSPLANTATION
+### ALL FRAGMENTS
+#### Adonis
+```{r}
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_post))
+distance_methods <-c("bc_rt_highcover_ns_abun_post", "uuni_rt_highcover_ns_abun_post", "wuni_rt_highcover_ns_abun_post")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "depth_m+status+Transplanted_from", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_post_depth_m_+status+Transplanted_from",date(),".txt"))
+} 
+
+```
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_post))
+# Pariwise Permutation MANOVAs: Transplanted from
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_post,df$Transplanted_from,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_post,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_post,df$depth_m,nperm=1000)
+
+
+```
+
+### ROSARIO ONLY
+#### Adonis
+```{r}
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_ros))
+distance_methods <-c("bc_rt_highcover_ns_abun_ros", "uuni_rt_highcover_ns_abun_ros", "wuni_rt_highcover_ns_abun_ros")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "depth_m+status", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_ros_depth_m_+status+Transplantation_status_nochlor",date(),".txt"))
+} 
+
+```
+
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_ros))
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_ros,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_ros,df$depth_m,nperm=1000)
+# Pariwise Permutation MANOVAs: Transplantation status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_ros,df$Transplantation_status,nperm=1000)
+
+
+```
+
+
+### VARADERO
+#### Adonis
+```{r}
+# RELATIVE ABUNDANCES
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_ns_abun_var))
+distance_methods <-c("bc_rt_highcover_ns_abun_var", "uuni_rt_highcover_ns_abun_var", "wuni_rt_highcover_ns_abun_var")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "depth_m+status", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_var_depth_m_+status_nochlor",date(),".txt"))
+} 
+
+```
+
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_ns_abun_var))
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_var,df$status,nperm=1000)
+
+# Pariwise Permutation MANOVAs: Depth
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_ns_abun_var,df$depth_m,nperm=1000)
+
+```
+
+### WATER SAMPLES ONLY
+#### Adonis
+```{r}
+# Make a data frame from the otu_data
+df <- data.frame(sample_data(rt_highcover_wat))
+distance_methods <-c("bc_rt_highcover_wat", "uuni_rt_highcover_wat", "wuni_rt_highcover_wat")
+set.seed(129)
+# Run for loop in distance matrices         
+for (i in distance_methods){ 
+  form <- as.formula(paste(i, "sampling_reef_name", sep="~"))
+  print(form)
+ adonis(form, data=df)->result
+ print(result)
+ capture.output(result, file = paste0("output/adonis/",i,"ADONIS_wat_nochlor",date(),".txt"))
+} 
+```
+
+#### Posthoc
+```{r}
+df <- data.frame(sample_data(rt_highcover_wat))
+# Pariwise Permutation MANOVAs: Detailed status
+set.seed(129)
+pairwise.perm.manova(bc_rt_highcover_wat,df$sampling_reef_name,nperm=1000)
+# UUNI
+set.seed(129)
+pairwise.perm.manova(uuni_rt_highcover_wat,df$sampling_reef_name,nperm=1000)
+```
+
+# Ordination to highlight significant differences
+## All samples: group signifiance testing (above) revealed season, depth and host to all be significant
+### Unconstrained ordination (PCoA)
+[link](https://bioconductor.org/packages/release/bioc/vignettes/phyloseq/inst/doc/phyloseq-analysis.html)
+
+## ALL CORAL SAMPLES
+```{r}
+# BRAY
+##Calculate the PCoA on this distance matrix
+rt.pcoa = ordinate(rt_highcover_ns_abun_noNA, method="PCoA", distance=bc_rt_highcover_ns_abun_noNA)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_ns_abun_noNA, rt.pcoa, "samples", color="transplanted_to", shape = "Transplanted_from") + stat_ellipse(level = 0.90,type = "t",aes(group=transplanted_to)) + ggtheme + scale_color_manual(values = site_col2) + geom_point(size = 2) + theme(text = element_text(size = 16))
+pcoa_bc
+pdf("output/plots/PCoA_bc_noNA.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+
+# UUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_noNA, method="PCoA", distance=uuni_rt_highcover_ns_abun_noNA)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_uuni<-0
+pcoa_uuni <- plot_ordination(rt_highcover_ns_abun_noNA, rt.pcoa, "samples", color="transplanted_to", shape = "Transplanted_from") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_uuni
+pdf("/output/plots/PCoA_uuni_noNA_v1_nochlor.pdf",width=9,height=5)
+pcoa_uuni
+dev.off()
+
+# WUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_noNA, method="PCoA", distance=wuni_rt_highcover_ns_abun_noNA)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_wuni<-0
+pcoa_wuni <- plot_ordination(rt_highcover_ns_abun_noNA, rt.pcoa, "samples", color="transplanted_to", shape = "Transplanted_from") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_wuni
+pdf("output/plots/PCoA_wuni_noNA_v1_nochlor.pdf",width=9,height=5)
+pcoa_wuni
+dev.off()
+
+```
+
+## ALL SAMPLES INCLUDING WATER
+```{r}
+# BRAY
+##Calculate the PCoA on this distance matrix
+rt.pcoa = ordinate(rt_highcover_ns_abun_allwat, method="PCoA", distance=bc_rt_highcover_ns_abun_allwat)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_ns_abun_allwat, rt.pcoa, "samples", color="transplanted_to") + stat_ellipse(level = 0.90,type = "t",aes(group=transplanted_to)) + ggtheme + scale_color_manual(values = site_col3) + geom_point(size = 2)
+pcoa_bc
+pdf("output/plots/PCoA_bc_allwat_transplantedto.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+
+# BRAY, only water samples collected in the second timepoint
+rt.pcoa = ordinate(rt_highcover_ns_abun_allwat_post, method="PCoA", distance=bc_rt_highcover_ns_abun_allwat_post)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_ns_abun_allwat_post, rt.pcoa, "samples", color="transplanted_to") + stat_ellipse(level = 0.90,type = "t",aes(group=transplanted_to)) + ggtheme + scale_color_manual(values = site_col4) + geom_point(shape = 16, size = 2)
+pcoa_bc
+pdf("output/plots/PCoA_bc_allwat_post.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+
+# UUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_post, method="PCoA", distance=uuni_rt_highcover_ns_abun_post)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_uuni<-0
+pcoa_uuni <- plot_ordination(rt_highcover_ns_abun_post, rt.pcoa, "samples", color="status") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_uuni
+pdf("output/plots/PCoA_uuni_post_v1.pdf",width=9,height=5)
+pcoa_uuni
+dev.off()
+
+# WUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_post, method="PCoA", distance=wuni_rt_highcover_ns_abun_post)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_wuni<-0
+pcoa_wuni <- plot_ordination(rt_highcover_ns_abun_post, rt.pcoa, "samples", color="status") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_wuni
+pdf("output/plots/PCoA_wuni_post_v1.pdf",width=9,height=5)
+pcoa_wuni
+dev.off()
+
+```
+
+
+## POST-TRANSPLANT CORALS
+```{r}
+# BRAY
+##Calculate the PCoA on this distance matrix
+rt.pcoa = ordinate(rt_highcover_ns_abun_post, method="PCoA", distance=bc_rt_highcover_ns_abun_post)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_ns_abun_post, rt.pcoa, "samples", color="transplanted_to", shape = "Transplanted_from") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme + scale_color_manual(values = site_col) + geom_point(size = 4) + theme(text = element_text(size = 16))
+pcoa_bc
+pdf("output/plots/PCoA_bc_post_biggerlegend.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+# UUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_post, method="PCoA", distance=uuni_rt_highcover_ns_abun_post)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_uuni<-0
+pcoa_uuni <- plot_ordination(rt_highcover_ns_abun_post, rt.pcoa, "samples", color="status") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_uuni
+pdf("output/plots/PCoA_uuni_post_v1.pdf",width=9,height=5)
+pcoa_uuni
+dev.off()
+
+# WUNI
+rt.pcoa = ordinate(rt_highcover_ns_abun_post, method="PCoA", distance=wuni_rt_highcover_ns_abun_post)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_wuni<-0
+pcoa_wuni <- plot_ordination(rt_highcover_ns_abun_post, rt.pcoa, "samples", color="status") + stat_ellipse(level = 0.90,type = "t",aes(group=status)) + ggtheme
+pcoa_wuni
+pdf("output/plots/PCoA_wuni_post_v1.pdf",width=9,height=5)
+pcoa_wuni
+dev.off()
+```
+
+## WATER SAMPLES ONLY
+```{r}
+# BRAY
+##Calculate the PCoA on this distance matrix
+rt.pcoa = ordinate(rt_highcover_wat, method="PCoA", distance=bc_rt_highcover_wat)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_wat, rt.pcoa, "samples", color="sampling_reef_name") + stat_ellipse(level = 0.90,type = "t",aes(group=sampling_reef_name)) + ggtheme + scale_color_manual(values = site_col) + geom_point(size = 2)
+pcoa_bc
+pdf("output/plots/PCoA_bc_water.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+
+# UUNI
+rt.pcoa = ordinate(rt_highcover_wat, method="PCoA", distance=uuni_rt_highcover_wat)
+plot_scree(rt.pcoa, "Screen plot")
+## PCoA ordination
+## Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_bc<-0
+pcoa_bc <- plot_ordination(rt_highcover_wat, rt.pcoa, "samples", color="sampling_reef_name") + stat_ellipse(level = 0.90,type = "t",aes(group=sampling_reef_name)) + ggtheme + scale_color_manual(values = site_col) + geom_point(shape = 16, size = 2)
+pcoa_bc
+pdf("output/plots/PCoA_uuni_wat.pdf",width=9,height=5)
+pcoa_bc
+dev.off()
+
+
+# WUNI
+rt.pcoa = ordinate(rt_highcover_wat, method="PCoA", distance=wuni_rt_highcover_wat)
+plot_scree(rt.pcoa, "Screen plot")
+# PCoA ordination
+# Define shapes
+a=c("a","b","c","d","e","f")
+pcoa_uuni<-0
+pcoa_uuni <- plot_ordination(rt_highcover_wat, rt.pcoa, "samples", color="sampling_reef_name") + stat_ellipse(level = 0.90,type = "t",aes(group=sampling_reef_name)) + ggtheme + scale_color_manual(values = site_col)
+pcoa_uuni
+pdf("output/plots/PCoA_wuni_wat.pdf",width=9,height=5)
+pcoa_uuni
+dev.off()
+
+
+```
+
+
+# TAXA SUMMARY BAR PLOTS
+
+## FAMILY: Cartagena post-transplant samples
+```{r}
+# Transform to relative abundance
+rt_highcover_ns_abun_cbay-> rt_cbay_rel
+## Replace counts in new object with relative abundance numbers
+otu_table(rt_cbay_rel) <-otu_table(decostand(otu_table(rt_highcover_ns_abun_cbay), 2, method = "total"), taxa_are_rows=TRUE)
+## FAMILY
+## Extract phylum level taxonomy
+rt_cbay.phy<-tax_glom(rt_cbay_rel,taxrank="Family")
+family <- as.data.frame(rt_cbay.phy@tax_table@.Data)
+taxa_names(rt_cbay.phy)<- family$Family # update taxa names
+
+## Find top 12 phyla by abundance
+sort(taxa_sums(rt_cbay.phy),decreasing=TRUE)[1:12] %>% names() -> top12phyla_cbay
+setdiff(taxa_names(rt_cbay.phy),top12phyla_cbay) -> rarephyla_cbay
+
+## Consolidate rare phyla into "Low abundance" category
+merged_rt_cbay.phy<-merge_taxa(rt_cbay.phy,rarephyla_cbay, archetype="OM27") %>%
+  prune_taxa(taxa_sums(.)>0,.)
+ntaxa(merged_rt_cbay.phy) # 13 taxa remain, as expected
+taxa_names(merged_rt_cbay.phy)
+
+## Extract phylum counts & sample metadata into a data frame
+phydata_cbay<-as(otu_table(merged_rt_cbay.phy),'matrix') %>% t() %>% as.data.frame() %>% 
+  mutate('X.SampleID'=factor(row.names(.))) %>% 
+  merge(.,as(sample_data(merged_rt_cbay.phy),'data.frame')%>%select(X.SampleID,Transplantation_status,transplanted_to),by='X.SampleID') %>% # merge with sample metadata
+  gather(key=Family,value=Abundance,2:14) %>% # melt data frame
+  ungroup %>% as.data.frame %>%
+  mutate(Family=ifelse(Family=='OM27','Low abundance',Family)) # rename OP8 as 'Low abundance' (OP8 is a placeholder for merged rare phyla)
+
+fam_tocbay <-
+  filter(phydata_cbay,Transplantation_status=='posttransplantation') %>%
+  mutate(X.SampleID=factor(X.SampleID)) %>%
+  mutate(Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_cbay[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=X.SampleID,y=100*Abundance,fill=Family,color=Family)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~transplanted_to,scales='free_x',strip.position = c("bottom"))+
+  theme_classic()+ 
+  ylab("Relative abundance (%)")+xlab("Transplanted to C. Bay")+
+  scale_fill_manual(values=pastel_palette_car[13:1],guide=FALSE)+
+  scale_color_manual(values=pastel_palette_car[13:1],guide=FALSE)+
+  scale_x_discrete(breaks=NULL)+
+  coord_flip()+
+  theme(strip.background=element_blank(),strip.text.x=element_text(size=15,face='bold',vjust=1.5))+
+  theme(axis.title.x=element_text(size=20,face='bold'))+
+  theme(axis.title.y=element_text(size=20,face='bold'),axis.text.y=element_text(size=20,face='bold'))
+pdf("output/plots/bar_plot_fam_tocbay12_v2_nochlor.pdf",width=9,height=5)
+fam_tocbay
+dev.off()
+
+pdf(file="output/plots/Taxa_summary_barplot_legend_family_tocbay12_nochlor.pdf",width=5,height=9)
+mutate(phydata_cbay,Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_cbay[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=transplanted_to,y=Abundance,fill=Family))+
+  geom_bar(stat='identity')+
+  scale_fill_manual(values=pastel_palette_car[13:1])+
+  guides(fill=guide_legend(reverse=TRUE))+
+  theme(legend.title=element_text(size=20,face='bold'),legend.text=element_text(size=14,face='bold'))
+dev.off()
+
+```
+
+## FAMILY: Rosario post-transplant fragments
+```{r}
+# Transform to relative abundance
+rt_highcover_ns_abun_toros-> rt_toros_rel
+## Replace counts in new object with relative abundance numbers
+otu_table(rt_toros_rel) <-otu_table(decostand(otu_table(rt_highcover_ns_abun_toros), 2, method = "total"), taxa_are_rows=TRUE)
+## FAMILY
+## Extract phylum level taxonomy
+rt_toros.phy<-tax_glom(rt_toros_rel,taxrank="Family")
+family <- as.data.frame(rt_toros.phy@tax_table@.Data)
+taxa_names(rt_toros.phy)<- family$Family # update taxa names
+
+## Find top 12 phyla by abundance
+sort(taxa_sums(rt_toros.phy),decreasing=TRUE)[1:12] %>% names() -> top12phyla_toros
+setdiff(taxa_names(rt_toros.phy),top12phyla_toros) -> rarephyla_toros
+
+## Consolidate rare phyla into "Low abundance" category
+merged_rt_toros.phy<-merge_taxa(rt_toros.phy,rarephyla_toros, archetype="OM27") %>%
+  prune_taxa(taxa_sums(.)>0,.)
+ntaxa(merged_rt_toros.phy) # 13 taxa remain, as expected
+taxa_names(merged_rt_toros.phy)
+
+## Extract phylum counts & sample metadata into a data frame
+phydata_toros<-as(otu_table(merged_rt_toros.phy),'matrix') %>% t() %>% as.data.frame() %>% 
+  mutate('X.SampleID'=factor(row.names(.))) %>% 
+  merge(.,as(sample_data(merged_rt_toros.phy),'data.frame')%>%select(X.SampleID,Transplantation_status,transplanted_to),by='X.SampleID') %>% # merge with sample metadata
+  gather(key=Family,value=Abundance,2:14) %>% # melt data frame
+  ungroup %>% as.data.frame %>%
+  mutate(Family=ifelse(Family=='OM27','Low abundance',Family)) # rename OP8 as 'Low abundance' (OP8 is a placeholder for merged rare phyla)
+
+fam_toros<-
+  filter(phydata_toros,Transplantation_status=='posttransplantation') %>%
+  mutate(X.SampleID=factor(X.SampleID)) %>%
+  mutate(Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_toros[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=X.SampleID,y=100*Abundance,fill=Family,color=Family)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~transplanted_to,scales='free_x',strip.position = c("bottom"))+
+  theme_classic()+ 
+  ylab("Relative abundance (%)")+xlab("Transplanted to Rosario")+
+  scale_fill_manual(values=pastel_palette_ros[13:1],guide=FALSE)+
+  scale_color_manual(values=pastel_palette_ros[13:1],guide=FALSE)+
+  scale_x_discrete(breaks=NULL)+
+  coord_flip()+
+  theme(plot.title=element_text(size=32,face='bold'))+
+  theme(strip.background=element_blank(),strip.text.x=element_text(size=15,face='bold',vjust=1.5))+
+  theme(axis.title.x=element_text(size=20,face='bold'))+
+  theme(axis.title.y=element_text(size=20,face='bold'),axis.text.y=element_text(size=20,face='bold'))
+pdf("output/plots/bar_plot_FJ_fam_toros12_v2_nochlor.pdf",width=9,height=5)
+fam_toros
+dev.off()
+
+pdf(file="output/plots/Taxa_summary_barplot_legend_family_toros12_nochlor.pdf",width=5,height=9)
+mutate(phydata_toros,Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_toros[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=transplanted_to,y=Abundance,fill=Family))+
+  geom_bar(stat='identity')+
+  scale_fill_manual(values=pastel_palette_ros[13:1])+
+  guides(fill=guide_legend(reverse=TRUE))+
+  theme(legend.title=element_text(size=20,face='bold'),legend.text=element_text(size=14,face='bold'))
+dev.off()
+
+```
+
+
+## FAMILY: Varadero post-transplant fragments
+```{r}
+# Transform to relative abundance
+rt_highcover_ns_abun_tovar-> rt_tovar_rel
+## Replace counts in new object with relative abundance numbers
+otu_table(rt_tovar_rel) <-otu_table(decostand(otu_table(rt_highcover_ns_abun_tovar), 2, method = "total"), taxa_are_rows=TRUE)
+## FAMILY
+## Extract phylum level taxonomy
+rt_tovar.phy<-tax_glom(rt_tovar_rel,taxrank="Family")
+family <- as.data.frame(rt_tovar.phy@tax_table@.Data)
+taxa_names(rt_tovar.phy)<- family$Family # update taxa names
+
+## Find top 12 phyla by abundance
+sort(taxa_sums(rt_tovar.phy),decreasing=TRUE)[1:12] %>% names() -> top12phyla_tovar
+setdiff(taxa_names(rt_tovar.phy),top12phyla_tovar) -> rarephyla_tovar
+
+## Consolidate rare phyla into "Low abundance" category
+merged_rt_tovar.phy<-merge_taxa(rt_tovar.phy,rarephyla_tovar, archetype="OM27") %>%
+  prune_taxa(taxa_sums(.)>0,.)
+ntaxa(merged_rt_tovar.phy) # 13 taxa remain, as expected
+taxa_names(merged_rt_tovar.phy)
+
+## Extract phylum counts & sample metadata into a data frame
+phydata_tovar<-as(otu_table(merged_rt_tovar.phy),'matrix') %>% t() %>% as.data.frame() %>% 
+  mutate('X.SampleID'=factor(row.names(.))) %>% 
+  merge(.,as(sample_data(merged_rt_tovar.phy),'data.frame')%>%select(X.SampleID,Transplantation_status,transplanted_to),by='X.SampleID') %>% # merge with sample metadata
+  gather(key=Family,value=Abundance,2:14) %>% # melt data frame
+  ungroup %>% as.data.frame %>%
+  mutate(Family=ifelse(Family=='OM27','Low abundance',Family)) # rename OP8 as 'Low abundance' (OP8 is a placeholder for merged rare phyla)
+
+
+fam_var<-
+  filter(phydata_tovar,Transplantation_status=='posttransplantation') %>%
+  mutate(X.SampleID=factor(X.SampleID)) %>%
+  mutate(Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_tovar[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=X.SampleID,y=100*Abundance,fill=Family,color=Family)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~transplanted_to,scales='free_x',strip.position = c("bottom"))+
+  theme_classic()+ 
+  ylab("Relative abundance (%)")+xlab("Transplanted to Varadero")+
+  scale_fill_manual(values=pastel_palette_var[13:1],guide=FALSE)+
+  scale_color_manual(values=pastel_palette_var[13:1],guide=FALSE)+
+  scale_x_discrete(breaks=NULL)+
+  coord_flip()+
+  theme(plot.title=element_text(size=32,face='bold'))+
+  theme(strip.background=element_blank(),strip.text.x=element_text(size=15,face='bold',vjust=1.5),strip.text.y = element_text(size=20,face='bold',vjust=1.5))+
+  theme(axis.title.x=element_text(size=20,face='bold'))+
+  theme(axis.title.y=element_text(size=20,face='bold'),axis.text.y=element_text(size=20,face='bold'))
+pdf("output/plots/bar_plot_FJ_fam_var12_nochlor.pdf",width=9,height=5)
+fam_var
+dev.off()
+
+pdf(file="output/plots/Taxa_summary_barplot_legend_family_tovar13_nochlor.pdf",width=5,height=9)
+mutate(phydata_tovar,Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_tovar[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=transplanted_to,y=Abundance,fill=Family))+
+  geom_bar(stat='identity')+
+  scale_fill_manual(values=pastel_palette_var[13:1])+
+  guides(fill=guide_legend(reverse=TRUE))+
+  theme(legend.title=element_text(size=20,face='bold'),legend.text=element_text(size=14,face='bold'))
+dev.off()
+
+
+```
+
+
+## FAMILY: PRETRANSPLANT FRAGMENTS VARADERO
+```{r}
+# Transform to relative abundance
+rt_highcover_ns_abun_E18_var-> rt_E18_var
+## Replace counts in new object with relative abundance numbers
+otu_table(rt_E18_var) <-otu_table(decostand(otu_table(rt_highcover_ns_abun_E18_var), 2, method = "total"), taxa_are_rows=TRUE)
+## FAMILY
+## Extract phylum level taxonomy
+rt_E18_var.phy<-tax_glom(rt_E18_var,taxrank="Family")
+family <- as.data.frame(rt_E18_var.phy@tax_table@.Data)
+taxa_names(rt_E18_var.phy)<- family$Family # update taxa names
+
+## Find top 12 phyla by abundance
+sort(taxa_sums(rt_E18_var.phy),decreasing=TRUE)[1:12] %>% names() -> top12phyla_E18var
+setdiff(taxa_names(rt_E18_var.phy),top12phyla_E18var) -> rarephyla_E18var
+
+## Consolidate rare phyla into "Low abundance" category
+merged_rt_E18var.phy<-merge_taxa(rt_E18_var.phy,rarephyla_E18var, archetype="CV106") %>%
+  prune_taxa(taxa_sums(.)>0,.)
+ntaxa(merged_rt_E18var.phy) # 13 taxa remain, as expected
+taxa_names(merged_rt_E18var.phy)
+
+## Extract phylum counts & sample metadata into a data frame
+phydata_E18var<-as(otu_table(merged_rt_E18var.phy),'matrix') %>% t() %>% as.data.frame() %>% 
+  mutate('X.SampleID'=factor(row.names(.))) %>% 
+  merge(.,as(sample_data(merged_rt_E18var.phy),'data.frame')%>%select(X.SampleID,Transplantation_status,Transplanted_from),by='X.SampleID') %>% # merge with sample metadata
+  gather(key=Family,value=Abundance,2:14) %>% # melt data frame
+  ungroup %>% as.data.frame %>%
+  mutate(Family=ifelse(Family=='CV106','Low abundance',Family)) # rename OP8 as 'Low abundance' (OP8 is a placeholder for merged rare phyla)
+
+
+fam_E18var<-
+  filter(phydata_E18var,Transplantation_status=='pretransplantation') %>%
+  mutate(X.SampleID=factor(X.SampleID)) %>%
+  mutate(Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_E18var[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=X.SampleID,y=100*Abundance,fill=Family,color=Family)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~Transplanted_from,scales='free_x',strip.position = c("bottom"))+
+  theme_classic()+ 
+  ylab("Relative abundance (%)")+xlab("Pre-transplant Varadero")+
+  scale_fill_manual(values=pastel_palette_E18var[13:1],guide=FALSE)+
+  scale_color_manual(values=pastel_palette_E18var[13:1],guide=FALSE)+
+  scale_x_discrete(breaks=NULL)+
+  coord_flip()+
+  theme(plot.title=element_text(size=32,face='bold'))+
+  theme(strip.background=element_blank(),strip.text.x=element_text(size=15,face='bold',vjust=1.5),strip.text.y = element_text(size=20,face='bold',vjust=1.5))+
+  theme(axis.title.x=element_text(size=20,face='bold'))+
+  theme(axis.title.y=element_text(size=20,face='bold'),axis.text.y=element_text(size=20,face='bold'))
+pdf("output/plots/bar_plot_fam_E18var_nochlor.pdf",width=9,height=5)
+fam_E18var
+dev.off()
+
+pdf(file="output/plots/Taxa_summary_barplot_legend_family_E18var13_nochlor.pdf",width=5,height=9)
+mutate(phydata_E18var,Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_E18var[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=Transplanted_from,y=Abundance,fill=Family))+
+  geom_bar(stat='identity')+
+  scale_fill_manual(values=pastel_palette_E18var[13:1])+
+  guides(fill=guide_legend(reverse=TRUE))+
+  theme(legend.title=element_text(size=20,face='bold'),legend.text=element_text(size=14,face='bold'))
+dev.off()
+
+
+```
+
+## FAMILY: PRETRANSPLANT FRAGMENTS ROSARIO
+```{r}
+# Transform to relative abundance
+rt_highcover_ns_abun_E18_ros-> rt_E18_ros
+## Replace counts in new object with relative abundance numbers
+otu_table(rt_E18_ros) <-otu_table(decostand(otu_table(rt_highcover_ns_abun_E18_ros), 2, method = "total"), taxa_are_rows=TRUE)
+## FAMILY
+## Extract phylum level taxonomy
+rt_E18_ros.phy<-tax_glom(rt_E18_ros,taxrank="Family")
+family <- as.data.frame(rt_E18_ros.phy@tax_table@.Data)
+taxa_names(rt_E18_ros.phy)<- family$Family # update taxa names
+
+## Find top 12 phyla by abundance
+sort(taxa_sums(rt_E18_ros.phy),decreasing=TRUE)[1:12] %>% names() -> top12phyla_E18ros
+setdiff(taxa_names(rt_E18_ros.phy),top12phyla_E18ros) -> rarephyla_E18ros
+
+## Consolidate rare phyla into "Low abundance" category
+merged_rt_E18ros.phy<-merge_taxa(rt_E18_ros.phy,rarephyla_E18ros, archetype="OM27") %>%
+  prune_taxa(taxa_sums(.)>0,.)
+ntaxa(merged_rt_E18ros.phy) # 13 taxa remain, as expected
+taxa_names(merged_rt_E18ros.phy)
+
+## Extract phylum counts & sample metadata into a data frame
+phydata_E18vros<-as(otu_table(merged_rt_E18ros.phy),'matrix') %>% t() %>% as.data.frame() %>% 
+  mutate('X.SampleID'=factor(row.names(.))) %>% 
+  merge(.,as(sample_data(merged_rt_E18ros.phy),'data.frame')%>%select(X.SampleID,Transplantation_status,Transplanted_from),by='X.SampleID') %>% # merge with sample metadata
+  gather(key=Family,value=Abundance,2:14) %>% # melt data frame
+  ungroup %>% as.data.frame %>%
+  mutate(Family=ifelse(Family=='OM27','Low abundance',Family)) # rename OP8 as 'Low abundance' (OP8 is a placeholder for merged rare phyla)
+
+
+fam_E18ros<-
+  filter(phydata_E18vros,Transplantation_status=='pretransplantation') %>%
+  mutate(X.SampleID=factor(X.SampleID)) %>%
+  mutate(Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_E18ros[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=X.SampleID,y=100*Abundance,fill=Family,color=Family)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~Transplanted_from,scales='free_x',strip.position = c("bottom"))+
+  theme_classic()+ 
+  ylab("Relative abundance (%)")+xlab("Pre-transplant Rosario")+
+  scale_fill_manual(values=pastel_palette_E18ros[13:1],guide=FALSE)+
+  scale_color_manual(values=pastel_palette_E18ros[13:1],guide=FALSE)+
+  scale_x_discrete(breaks=NULL)+
+  coord_flip()+
+  theme(plot.title=element_text(size=32,face='bold'))+
+  theme(strip.background=element_blank(),strip.text.x=element_text(size=15,face='bold',vjust=1.5),strip.text.y = element_text(size=20,face='bold',vjust=1.5))+
+  theme(axis.title.x=element_text(size=20,face='bold'))+
+  theme(axis.title.y=element_text(size=20,face='bold'),axis.text.y=element_text(size=20,face='bold'))
+pdf("output/plots/bar_plot_fam_E18ros_nochlor.pdf",width=9,height=5)
+fam_E18ros
+dev.off()
+
+pdf(file="output/plots/Taxa_summary_barplot_legend_family_E18ros13_nochlor.pdf",width=5,height=9)
+mutate(phydata_E18vros,Family=ordered(Family,levels=rev(c('Low abundance',top12phyla_E18ros[1:12])))) %>%
+  arrange(Family) %>%
+ggplot(.,aes(x=Transplanted_from,y=Abundance,fill=Family))+
+  geom_bar(stat='identity')+
+  scale_fill_manual(values=pastel_palette_E18ros[13:1])+
+  guides(fill=guide_legend(reverse=TRUE))+
+  theme(legend.title=element_text(size=20,face='bold'),legend.text=element_text(size=14,face='bold'))
+dev.off()
+
+
+```
+
+
+# ALPHA DIVERSITY
+## Post-transplant coral fragments
+```{r}
+# Return table with selected diversity indicators
+tab <- diversities(rt_highcover_ns_abun_post, index = "all")
+kable(head(tab))
+
+# Get metadata from pyloseq object
+rt_highcover_ns_abun_post.meta <- meta(rt_highcover_ns_abun_post)
+kable(head(rt_highcover_ns_abun_post.meta))
+
+# Add diversity table to metadata
+rt_highcover_ns_abun_post.meta$chao1 <- tab$chao1
+rt_highcover_ns_abun_post.meta$Shannon <- tab$diversity_shannon
+
+# Create list of pairwise comparisons
+var <- levels(rt_highcover_ns_abun_post.meta$status) # get the variables
+var.pairs <- combn(seq_along(var), 2, simplify = FALSE, FUN = function(i)var[i])
+print(var.pairs)
+
+to <- levels(rt_highcover_ns_abun_post.meta$transplanted_to)
+to.pairs <- combn(seq_along(to), 2, simplify = FALSE, FUN = function(i)to[i])
+
+p3 <- ggviolin(rt_highcover_ns_abun_post.meta, x = "transplanted_to", y = "chao1", add = "boxplot", fill = "transplanted_to", palette = site_col2) + ggtheme + scale_color_manual(values = site_col)
+
+print(p3)
+
+p4 <- p3 + stat_compare_means(comparisons = to.pairs, method = "wilcox.test")
+
+print(p4)
+
+pdf("output/plots/Adiv_post_transplantedto_nochlor.pdf")
+p4
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
